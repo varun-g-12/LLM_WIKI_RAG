@@ -2,6 +2,7 @@ import logging
 from typing import Any, Literal, Optional, TypedDict
 
 from dotenv import load_dotenv
+from langchain_community.retrievers import WikipediaRetriever
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai.chat_models import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
@@ -15,24 +16,71 @@ logging.basicConfig(
 
 class AgentState(TypedDict):
     user_query: str
-    context: Optional[str]
+    context: Optional[list[str]]
     answer: str
     review: Literal["yes", "no"]
+    feedback: str
+    wiki_query: str
 
 
-def evaluate_answer_quality(state: AgentState):
+def wiki_search(state: AgentState) -> dict[str, Any]:
+    query = state["wiki_query"]
+    logging.info("Searching Wikipedia for query: %s", query)
+    retriever = WikipediaRetriever(top_k_results=3)  # type: ignore
+    response = retriever.invoke(query)
+    return {"context": response}
+
+
+def provide_feedback(state: AgentState) -> dict[str, Any]:
+    logging.info("Providing feedback for user query: %s", state["user_query"])
+
+    prompt = """You are a precise feedback evaluator. Analyze the alignment between questions and answers.
+
+    Task:
+    1. Compare user query with provided answer
+    2. Identify information gaps
+
+    Required output format (JSON):
+    {
+        "feedback": "One clear sentence describing what's missing from the answer",
+        "wiki_query": "Specific search term for Wikipedia to fill the gap"
+    }
+
+    Guidelines:
+    - Feedback must be actionable and specific
+    - Wiki query should target the missing information directly
+    - Keep feedback concise and constructive"""
+
+    chat_model = initialize_chat_model().with_structured_output(method="json_mode")
+
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(
+            content=f"User's query: {state['user_query']}\nAnswer: {state['answer']}"
+        ),
+    ]
+    logging.info("Sending feedback request to chat model")
+    response = chat_model.invoke(messages)
+    logging.info("Received feedback response: %s", response)
+
+    return {
+        "feedback": response["feedback"],
+        "wiki_query": response["wiki_query"],
+    }
+
+
+def router(state: AgentState) -> str:
+    return state["review"]
+
+
+def evaluate_answer_quality(state: AgentState) -> dict[str, Any]:
     logging.info("Evaluating answer quality for user query: %s", state["user_query"])
 
     prompt = """You are a Quality Assurance expert. Your task is to evaluate if the provided answer directly addresses the user's query.
 
-    Evaluation criteria:
-    - Relevance: Does the answer specifically address the main question?
-    - Completeness: Is the answer sufficiently complete?
-    - Clarity: Is the answer clear and understandable?
-
     Respond ONLY with:
-    'yes' - if the answer meets all criteria
-    'no' - if the answer fails any criterion"""
+    'yes' - if the user query is answered 
+    'no' - if the user query is been not answered"""
 
     chat_model = initialize_chat_model()
 
@@ -88,10 +136,16 @@ def create_agent() -> CompiledStateGraph:
 
     state_graph.add_node("answer_node", generate_answer)
     state_graph.add_node("review_node", evaluate_answer_quality)
+    state_graph.add_node("feedback_node", provide_feedback)
+    state_graph.add_node("wiki_node", wiki_search)
 
     state_graph.add_edge(START, "answer_node")
     state_graph.add_edge("answer_node", "review_node")
-    state_graph.add_edge("review_node", END)
+    state_graph.add_conditional_edges(
+        "review_node", router, {"yes": END, "no": "feedback_node"}
+    )
+    state_graph.add_edge("feedback_node", "wiki_node")
+    state_graph.add_edge("wiki_node", "answer_node")
 
     compiled_graph = state_graph.compile()
     logging.info("State graph agent created and compiled")
@@ -122,6 +176,8 @@ def get_response(query: str) -> dict[str, Any]:
 
 if __name__ == "__main__":
     # query = "What is the capital of Nigeria?"
-    query = "Who won IPL in 2024?"
+    query = "when is the 2025 IPL is scheduled "
     response = get_response(query)
-    print(response)
+
+    print("=" * 100)
+    print(response["answer"])
