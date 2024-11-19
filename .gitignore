@@ -1,1 +1,3 @@
 .env
+LLM_WIKI_RAG.egg-info/
+src/__pycache__/
